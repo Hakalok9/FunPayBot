@@ -1,0 +1,29 @@
+[Unit]
+Description=FunPay Viper Bot (Production)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/funpaybot
+EnvironmentFile=/home/botuser/funpaybot/.env
+
+# Команда запуска
+ExecStart=/home/botuser/funpaybot/venv/bin/python /home/botuser/funpaybot/bot.py
+
+# Автоматический перезапуск при падении
+Restart=on-failure
+RestartSec=5
+
+# Лимиты
+LimitNOFILE=4096
+MemoryLimit=512M
+
+# Логирование
+StandardOutput=append:/var/log/funpaybot/output.log
+StandardError=append:/var/log/funpaybot/error.log
+
+[Install]
+WantedBy=multi-user.target
