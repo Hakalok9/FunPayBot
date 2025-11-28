@@ -1,59 +1,78 @@
+"""
+handlers/message_handler.py
+"""
+
 import logging
 from datetime import datetime
-from utils.helpers import generate_message_hash
+from typing import Optional
 
 logger = logging.getLogger("FunPayBot.MessageHandler")
 
 class MessageHandler:
-    def __init__(self, database, account_id, telegram_bot, autoresponder=None):
-        self.db = database
-        self.account_id = account_id
+    def __init__(self, database, telegram_bot, autoresponder, queue_manager):
+        self.database = database
         self.telegram_bot = telegram_bot
         self.autoresponder = autoresponder
+        self.queue_manager = queue_manager
+        self.stats = {
+            "messages_processed": 0,
+            "autoresponses_sent": 0,
+            "errors": 0
+        }
         logger.info("✓ Обработчик сообщений инициализирован")
 
     async def handle(self, message):
+        """
+        Обработка нового сообщения
+        НЕ пытаемся получить историю чата - работаем только с данными из события
+        
+        Args:
+            message: Объект сообщения из FunPayAPI (types.Message)
+        """
         try:
-            if message.author_id == self.account_id:
-                logger.debug(f"Игнорируем собственное сообщение (chat_id={message.chat_id})")
+            # Извлекаем данные НАПРЯМУЮ из объекта message
+            chat_id = getattr(message, 'chat_id', None)
+            author = getattr(message, 'author', 'Unknown')
+            text = getattr(message, 'text', '')
+            
+            if not chat_id:
+                logger.error("❌ Сообщение без chat_id, пропускаем")
                 return False
 
-            # КРИТИЧНО: генерация хэша для дедупликации
-            msg_hash = generate_message_hash(message.chat_id, message.text, datetime.now())
+            logger.info(f"📥 Новое сообщение от {author} (chat_id={chat_id}): {text[:50]}")
 
-            # КРИТИЧНО: проверка дубликата в БД перед обработкой
-            if await self.db.message_exists_by_hash(msg_hash):
-                logger.debug(f"Дубликат сообщения (hash={msg_hash[:8]}...), игнорируем")
-                return False
-
-            logger.info(f"📨 Новое сообщение от {message.author} (chat_id={message.chat_id}): {message.text[:50]}...")
-
-            await self.db.add_or_update_user(funpay_user_id=message.author_id, username=message.author)
-
-            # Сохраняем с хэшем
-            await self.db.add_message(
-                chat_id=message.chat_id,
-                author_id=message.author_id,
-                author_username=message.author,
-                text=message.text,
-                is_outgoing=False,
-                message_hash=msg_hash
-            )
-
-            if self.telegram_bot:
+            # Отправляем уведомление в Telegram (БЕЗ попыток получить историю)
+            try:
                 await self.telegram_bot.send_message_notification(
-                    chat_id=message.chat_id,
-                    username=message.author,
-                    text=message.text,
-                    timestamp=datetime.now()
+                    chat_id=chat_id,
+                    username=author,
+                    text=text
                 )
+                logger.info(f"✅ Уведомление отправлено в Telegram (chat_id={chat_id})")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка отправки уведомления: {e}", exc_info=True)
 
-            if self.autoresponder:
-                auto_response = await self.autoresponder.get_response(message.text)
-                if auto_response:
-                    logger.info(f"🤖 Автоответ: {auto_response[:50]}...")
+            # Сохраняем в БД
+            try:
+                await self.database.save_message(
+                    chat_id=chat_id,
+                    username=author,
+                    text=text,
+                    timestamp=datetime.now(),
+                    is_incoming=True
+                )
+                logger.info(f"✅ Сообщение сохранено в БД (chat_id={chat_id})")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка сохранения в БД: {e}")
 
+            self.stats["messages_processed"] += 1
             return True
+
         except Exception as e:
-            logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
+            self.stats["errors"] += 1
+            logger.error(f"❌ Критическая ошибка обработки сообщения: {e}", exc_info=True)
             return False
+
+    def get_stats(self):
+        """Получение статистики"""
+        return self.stats.copy()

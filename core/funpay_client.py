@@ -1,3 +1,7 @@
+"""
+core/funpay_client.py
+"""
+
 import asyncio
 import logging
 from typing import Optional, Callable
@@ -8,6 +12,9 @@ from utils.helpers import sanitize_for_funpay
 from config import Config
 
 logger = logging.getLogger("FunPayBot.FunPayClient")
+
+# Дефолтный USER_AGENT, если не задан в Config
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 class FunPayClient:
     def __init__(self, token, requests_delay=4, notify_admin_callback=None):
@@ -28,7 +35,7 @@ class FunPayClient:
         }
         self.last_event_time = None
         logger.info("✓ FunPay клиент инициализирован")
-        
+
     async def connect(self):
         """Подключение к FunPay с retry"""
         max_attempts = 3
@@ -36,145 +43,127 @@ class FunPayClient:
             try:
                 logger.info(f"🔄 Подключение к FunPay... (попытка {attempt}/{max_attempts})")
                 
-                # Увеличенный таймаут через asyncio.wait_for
-                self.account = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: Account(self.token).get()),
-                    timeout=30.0  # 30 секунд на попытку
-                )
+                # Получаем USER_AGENT из Config или используем дефолтный
+                user_agent = getattr(Config, 'USER_AGENT', DEFAULT_USER_AGENT)
                 
-                logger.info(f"✓ Авторизован как: {self.account.username} (ID: {self.account.id})")
+                # Создаём аккаунт
+                self.account = Account(self.token, user_agent=user_agent)
+                
+                # КРИТИЧНО: Вызываем get() для инициализации аккаунта
+                await asyncio.get_event_loop().run_in_executor(None, self.account.get)
+                
+                # Теперь создаём Runner БЕЗ автоматического получения истории
                 self.runner = Runner(self.account)
                 self.connected = True
+                
+                username = getattr(self.account, 'username', 'Unknown')
+                user_id = getattr(self.account, 'id', 'Unknown')
+                logger.info(f"✓ Авторизован как: {username} (ID: {user_id})")
                 return True
-                
-            except asyncio.TimeoutError:
-                logger.error(f"✗ Таймаут подключения к FunPay (попытка {attempt}/{max_attempts})")
-                if attempt < max_attempts:
-                    await asyncio.sleep(2)
-                    
-            except Exception as e:
-                logger.error(f"✗ Ошибка подключения к FunPay: {e}")
-                self.stats["connection_errors"] += 1
-                if attempt < max_attempts:
-                    await asyncio.sleep(2)
-        
-        # Все попытки провалились
-        return False
-            
-    async def start_listening(self):
-        """Прослушивание с exponential backoff и watchdog"""
-        if not self.connected:
-            raise RuntimeError("Сначала нужно подключиться через connect()")
-        
-        self.running = True
-        backoff = 1
-        max_backoff = Config.RECONNECT_MAX_BACKOFF
-        watchdog_timeout = Config.WATCHDOG_TIMEOUT
-        self.last_event_time = datetime.now()
-        
-        # Запуск watchdog
-        asyncio.create_task(self._watchdog(watchdog_timeout))
-        
-        while self.running:
-            try:
-                logger.info("🔄 Запуск прослушивания событий FunPay...")
-                
-                # Обработка событий в отдельном потоке
-                for event in self.runner.listen(requests_delay=self.requests_delay):
-                    if not self.running:
-                        break
-                    self.last_event_time = datetime.now()
-                    await self._handle_event(event)
-                
-                # Успешная работа - сброс backoff
-                backoff = 1
-                
-            except KeyboardInterrupt:
-                logger.info("⚠️ Получен сигнал остановки")
-                break
             except Exception as e:
                 self.stats["connection_errors"] += 1
-                logger.error(f"✗ Ошибка прослушивания FunPay: {e}")
+                logger.error(f"✗ Ошибка подключения (попытка {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(5)
+                else:
+                    raise
+
+    def register_handler(self, event_type: str, handler: Callable):
+        """Регистрация обработчика событий"""
+        if event_type not in self.event_handlers:
+            self.event_handlers[event_type] = []
+        self.event_handlers[event_type].append(handler)
+        logger.info(f"✓ Зарегистрирован обработчик для {event_type}")
+
+    async def _trigger_handlers(self, event_type: str, event_data):
+        """Вызов зарегистрированных обработчиков"""
+        if event_type in self.event_handlers:
+            for handler in self.event_handlers[event_type]:
+                try:
+                    await handler(event_data)
+                except Exception as e:
+                    logger.error(f"Ошибка в обработчике {event_type}: {e}", exc_info=True)
+
+    def _sync_listen_loop(self):
+        """СИНХРОННЫЙ цикл прослушивания (запускается в отдельном потоке)"""
+        logger.info("🔄 Запуск прослушивания событий FunPay (sync loop)...")
+        try:
+            for event in self.runner.listen(requests_delay=self.requests_delay):
+                if not self.running:
+                    logger.info("⏹️ Остановка прослушивания событий")
+                    break
                 
-                # Уведомление админа при долгом backoff
-                if backoff >= 60 and self.notify_admin_callback:
-                    await self.notify_admin_callback(
-                        f"FunPay connection unstable\nBackoff: {backoff}s\nError: {str(e)[:100]}"
-                    )
-                
-                logger.warning(f"Переподключение через {backoff}s...")
-                await asyncio.sleep(backoff)
-                
-                # Exponential backoff с капом
-                backoff = min(backoff * 2, max_backoff)
+                self.last_event_time = datetime.now()
                 
                 try:
-                    await self.reconnect()
-                    backoff = 1  # Успешно переподключились
-                except Exception as reconnect_error:
-                    logger.error(f"✗ Ошибка переподключения: {reconnect_error}")
+                    # Обрабатываем события через asyncio
+                    if event.type == enums.EventTypes.NEW_MESSAGE:
+                        self.stats["messages_received"] += 1
+                        logger.info(f"📥 Новое сообщение получено")
+                        # Создаём задачу в главном event loop
+                        asyncio.run_coroutine_threadsafe(
+                            self._trigger_handlers("NEW_MESSAGE", event.message),
+                            asyncio.get_event_loop()
+                        )
+                    elif event.type == enums.EventTypes.NEW_ORDER:
+                        self.stats["orders_received"] += 1
+                        logger.info(f"🛒 Новый заказ получен")
+                        asyncio.run_coroutine_threadsafe(
+                            self._trigger_handlers("NEW_ORDER", event.order),
+                            asyncio.get_event_loop()
+                        )
+                except Exception as e:
+                    logger.error(f"⚠️ Ошибка обработки события: {e}", exc_info=True)
+                    # Продолжаем цикл, не прерываем
+                    continue
                     
-    async def _watchdog(self, timeout_seconds):
-        """Watchdog: уведомление если нет событий > N минут"""
-        while self.running:
-            await asyncio.sleep(60)  # Проверка каждую минуту
-            if not self.last_event_time:
-                continue
-            elapsed = (datetime.now() - self.last_event_time).total_seconds()
-            if elapsed > timeout_seconds:
-                logger.warning(f"⚠️ WATCHDOG: Нет событий уже {elapsed:.0f}s")
-                if self.notify_admin_callback:
-                    await self.notify_admin_callback(
-                        f"⚠️ WATCHDOG ALERT\n\nНет событий от FunPay уже {elapsed/60:.1f} минут\n\nВозможно проблема с подключением"
-                    )
-                self.last_event_time = datetime.now()  # Сброс чтобы не спамить
-                    
-    async def reconnect(self):
-        logger.info("🔄 Попытка переподключения...")
-        self.stats["reconnects"] += 1
-        self.connected = False
-        success = await self.connect()
-        if success:
-            logger.info("✓ Переподключение успешно")
-        else:
-            raise RuntimeError("Не удалось переподключиться")
-            
+        except Exception as e:
+            logger.error(f"Ошибка в sync listen loop: {e}", exc_info=True)
+            self.running = False
+
+    async def start_listening(self):
+        """Запуск прослушивания событий в отдельном потоке"""
+        if not self.connected:
+            raise RuntimeError("FunPay клиент не подключен")
+        
+        self.running = True
+        
+        # Запускаем синхронный цикл в executor (отдельный поток)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._sync_listen_loop)
+
     async def stop(self):
+        """Остановка клиента"""
         logger.info("⏹️ Остановка FunPay клиента...")
         self.running = False
+        if self.runner:
+            try:
+                self.runner.stop()
+            except:
+                pass
         self.connected = False
-        
-    async def _handle_event(self, event):
+        logger.info("✓ FunPay клиент остановлен")
+
+    @async_retry(max_attempts=3, delay=2)
+    async def send_message(self, chat_id: int, text: str):
+        """Отправка сообщения с retry"""
         try:
-            if event.type is enums.EventTypes.NEW_MESSAGE:
-                self.stats["messages_received"] += 1
-                handler = self.event_handlers.get("on_message")
-                if handler:
-                    await handler(event.message)
-            elif event.type is enums.EventTypes.NEW_ORDER:
-                self.stats["orders_received"] += 1
-                handler = self.event_handlers.get("on_order")
-                if handler:
-                    await handler(event.order)
-            # ORDER_UPDATE не существует в FunPayAPI - убрано
-        except Exception as e:
-            logger.error(f"✗ Ошибка обработки события: {e}", exc_info=True)
-            
-    def on(self, event_name, handler):
-        self.event_handlers[event_name] = handler
-        logger.debug(f"✓ Обработчик зарегистрирован: {event_name}")
-        
-    @async_retry(max_attempts=3, delay=2.0, backoff=2.0)
-    async def send_message(self, chat_id, text):
-        try:
-            clean_text = sanitize_for_funpay(text)
-            await asyncio.to_thread(self.account.send_message, chat_id, clean_text)
+            sanitized_text = sanitize_for_funpay(text)
+            # FunPayAPI send_message синхронный, оборачиваем
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, 
+                self.account.send_message, 
+                chat_id, 
+                sanitized_text
+            )
             self.stats["messages_sent"] += 1
-            logger.debug(f"✓ Сообщение отправлено в чат {chat_id}")
+            logger.info(f"✅ Сообщение отправлено в чат {chat_id}")
             return True
         except Exception as e:
-            logger.error(f"✗ Ошибка отправки сообщения: {e}")
+            logger.error(f"✗ Ошибка отправки сообщения в чат {chat_id}: {e}")
             raise
-            
+
     def get_stats(self):
-        return {**self.stats, "connected": self.connected, "running": self.running}
+        """Получение статистики"""
+        return self.stats.copy()
