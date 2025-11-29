@@ -1,19 +1,16 @@
 """
-core/funpay_client.py
+core/funpay_client.py - ИСПРАВЛЕННЫЙ
 """
 
 import asyncio
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Set
 from datetime import datetime, timedelta
 from FunPayAPI import Account, Runner, types, enums
-from utils.retry import async_retry
-from utils.helpers import sanitize_for_funpay
 from config import Config
 
 logger = logging.getLogger("FunPayBot.FunPayClient")
 
-# Дефолтный USER_AGENT, если не задан в Config
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 class FunPayClient:
@@ -26,12 +23,19 @@ class FunPayClient:
         self.connected = False
         self.running = False
         self.event_handlers = {}
+        self.main_loop = None
+        self.my_username = None  # Сохраняем своё имя для фильтрации
+        
+        # Трекинг отправленных сообщений (чтобы не дублировать)
+        self.sent_messages: Set[str] = set()  # "chat_id:text_hash"
+        
         self.stats = {
             "messages_sent": 0,
             "messages_received": 0,
             "orders_received": 0,
             "connection_errors": 0,
-            "reconnects": 0
+            "reconnects": 0,
+            "total_events_received": 0
         }
         self.last_event_time = None
         logger.info("✓ FunPay клиент инициализирован")
@@ -43,23 +47,24 @@ class FunPayClient:
             try:
                 logger.info(f"🔄 Подключение к FunPay... (попытка {attempt}/{max_attempts})")
                 
-                # Получаем USER_AGENT из Config или используем дефолтный
                 user_agent = getattr(Config, 'USER_AGENT', DEFAULT_USER_AGENT)
-                
-                # Создаём аккаунт
                 self.account = Account(self.token, user_agent=user_agent)
                 
-                # КРИТИЧНО: Вызываем get() для инициализации аккаунта
+                # Инициализация аккаунта
                 await asyncio.get_event_loop().run_in_executor(None, self.account.get)
                 
-                # Теперь создаём Runner БЕЗ автоматического получения истории
                 self.runner = Runner(self.account)
                 self.connected = True
+                self.main_loop = asyncio.get_event_loop()
                 
-                username = getattr(self.account, 'username', 'Unknown')
+                # ВАЖНО: Сохраняем своё имя пользователя!
+                self.my_username = getattr(self.account, 'username', None)
+                
+                username = self.my_username or 'Unknown'
                 user_id = getattr(self.account, 'id', 'Unknown')
                 logger.info(f"✓ Авторизован как: {username} (ID: {user_id})")
                 return True
+                
             except Exception as e:
                 self.stats["connection_errors"] += 1
                 logger.error(f"✗ Ошибка подключения (попытка {attempt}/{max_attempts}): {e}")
@@ -78,15 +83,42 @@ class FunPayClient:
     async def _trigger_handlers(self, event_type: str, event_data):
         """Вызов зарегистрированных обработчиков"""
         if event_type in self.event_handlers:
+            logger.info(f"🔄 Вызываю обработчики для {event_type} (всего: {len(self.event_handlers[event_type])})")
             for handler in self.event_handlers[event_type]:
                 try:
                     await handler(event_data)
                 except Exception as e:
                     logger.error(f"Ошибка в обработчике {event_type}: {e}", exc_info=True)
 
+    def _is_my_message(self, chat) -> bool:
+        """Проверяет, является ли сообщение исходящим (от нас)"""
+        try:
+            # Проверка по флагу unread - если False после отправки нами, то это наше сообщение
+            unread = getattr(chat, 'unread', True)
+            
+            # Получаем текст сообщения
+            text = getattr(chat, 'last_message_text', '') or ''
+            chat_id = getattr(chat, 'id', 0)
+            
+            # Проверяем, отправляли ли мы это сообщение недавно
+            msg_key = f"{chat_id}:{hash(text)}"
+            if msg_key in self.sent_messages:
+                logger.info(f"⏭️ Пропускаем своё сообщение: {text[:30]}...")
+                self.sent_messages.discard(msg_key)  # Удаляем из трекинга
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки сообщения: {e}")
+            return False
+
     def _sync_listen_loop(self):
-        """СИНХРОННЫЙ цикл прослушивания (запускается в отдельном потоке)"""
+        """СИНХРОННЫЙ цикл прослушивания"""
         logger.info("🔄 Запуск прослушивания событий FunPay (sync loop)...")
+        logger.info(f"📊 Обработчики зарегистрированы: {list(self.event_handlers.keys())}")
+        logger.info(f"📍 Главный event loop: {self.main_loop}")
+        
         try:
             for event in self.runner.listen(requests_delay=self.requests_delay):
                 if not self.running:
@@ -94,41 +126,56 @@ class FunPayClient:
                     break
                 
                 self.last_event_time = datetime.now()
+                self.stats["total_events_received"] += 1
                 
                 try:
-                    # Обрабатываем события через asyncio
-                    if event.type == enums.EventTypes.NEW_MESSAGE:
-                        self.stats["messages_received"] += 1
-                        logger.info(f"📥 Новое сообщение получено")
-                        # Создаём задачу в главном event loop
-                        asyncio.run_coroutine_threadsafe(
-                            self._trigger_handlers("NEW_MESSAGE", event.message),
-                            asyncio.get_event_loop()
-                        )
+                    # Пропускаем INITIAL_CHAT
+                    if event.type == enums.EventTypes.INITIAL_CHAT:
+                        continue
+                    
+                    event_type_name = str(event.type).split('.')[-1] if event.type else "UNKNOWN"
+                    logger.info(f"🎯 СОБЫТИЕ #{self.stats['total_events_received']}: type={event_type_name}")
+                    
+                    if event.type == enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED:
+                        logger.info(f"📥 Новое/изменённое сообщение в чате!")
+                        logger.info(f"   event.chat = {event.chat}")
+                        
+                        if hasattr(event, 'chat') and event.chat:
+                            # ВАЖНО: Проверяем, не наше ли это сообщение!
+                            if self._is_my_message(event.chat):
+                                continue  # Пропускаем свои сообщения
+                            
+                            self.stats["messages_received"] += 1
+                            asyncio.run_coroutine_threadsafe(
+                                self._trigger_handlers("NEW_MESSAGE", event.chat),
+                                self.main_loop
+                            )
+                        
+                    elif event.type == enums.EventTypes.CHATS_LIST_CHANGED:
+                        logger.info(f"📋 Список чатов изменился")
+                        
                     elif event.type == enums.EventTypes.NEW_ORDER:
                         self.stats["orders_received"] += 1
-                        logger.info(f"🛒 Новый заказ получен")
+                        logger.info(f"🛒 Новый заказ!")
                         asyncio.run_coroutine_threadsafe(
                             self._trigger_handlers("NEW_ORDER", event.order),
-                            asyncio.get_event_loop()
+                            self.main_loop
                         )
+                        
                 except Exception as e:
-                    logger.error(f"⚠️ Ошибка обработки события: {e}", exc_info=True)
-                    # Продолжаем цикл, не прерываем
+                    logger.error(f"❌ Ошибка обработки события: {e}", exc_info=True)
                     continue
                     
         except Exception as e:
-            logger.error(f"Ошибка в sync listen loop: {e}", exc_info=True)
+            logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в listen(): {e}", exc_info=True)
             self.running = False
 
     async def start_listening(self):
-        """Запуск прослушивания событий в отдельном потоке"""
+        """Запуск прослушивания событий"""
         if not self.connected:
             raise RuntimeError("FunPay клиент не подключен")
         
         self.running = True
-        
-        # Запускаем синхронный цикл в executor (отдельный поток)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._sync_listen_loop)
 
@@ -144,22 +191,34 @@ class FunPayClient:
         self.connected = False
         logger.info("✓ FunPay клиент остановлен")
 
-    @async_retry(max_attempts=3, delay=2)
     async def send_message(self, chat_id: int, text: str):
-        """Отправка сообщения с retry"""
+        """Отправка сообщения в FunPay"""
         try:
-            sanitized_text = sanitize_for_funpay(text)
-            # FunPayAPI send_message синхронный, оборачиваем
+            if not text or not text.strip():
+                logger.error(f"❌ Пустое сообщение, отправка отменена")
+                return False
+            
+            clean_text = text.strip()
+            
+            logger.info(f"📤 Отправляю сообщение в чат {chat_id}: {clean_text[:50]}...")
+            
+            # ТРЕКИНГ: Запоминаем что отправили это сообщение
+            msg_key = f"{chat_id}:{hash(clean_text)}"
+            self.sent_messages.add(msg_key)
+            
+            # Отправляем (синхронный метод)
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None, 
                 self.account.send_message, 
                 chat_id, 
-                sanitized_text
+                clean_text
             )
+            
             self.stats["messages_sent"] += 1
             logger.info(f"✅ Сообщение отправлено в чат {chat_id}")
             return True
+            
         except Exception as e:
             logger.error(f"✗ Ошибка отправки сообщения в чат {chat_id}: {e}")
             raise

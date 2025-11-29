@@ -32,6 +32,7 @@ from handlers.order_handler import OrderHandler
 
 logger = setup_logger()
 
+
 class FunPayBot:
     def __init__(self):
         self.running = False
@@ -67,7 +68,7 @@ class FunPayBot:
             send_delay=Config.MESSAGE_SEND_DELAY
         )
 
-        # Telegram Bot (с callback для ответов)
+        # Telegram Bot (с callback для ответов И ссылкой на funpay_client!)
         async def reply_callback(chat_id: int, text: str):
             await self.funpay_client.send_message(chat_id, text)
             return True
@@ -75,7 +76,8 @@ class FunPayBot:
         self.telegram_bot = TelegramBot(
             token=Config.TELEGRAM_BOT_TOKEN,
             admin_id=Config.TELEGRAM_ADMIN_ID,
-            on_reply_callback=reply_callback
+            on_reply_callback=reply_callback,
+            funpay_client=self.funpay_client  # ← ДОБАВЛЕНО!
         )
 
         # Message Handler (БЕЗ autoresponder)
@@ -126,7 +128,6 @@ class FunPayBot:
         logger.info("=" * 80)
         logger.info("🛑 ОСТАНОВКА БОТА (GRACEFUL SHUTDOWN)...")
         logger.info("=" * 80)
-        
         self.running = False
 
         if self.funpay_client:
@@ -152,10 +153,11 @@ class FunPayBot:
 
         logger.info("✓ Все компоненты остановлены")
 
+
 async def main():
     """Главная функция с правильным управлением event loop"""
     bot = FunPayBot()
-
+    
     # Signal handlers для graceful shutdown
     def signal_handler(sig, frame):
         logger.info(f"Получен сигнал {sig}, остановка бота...")
@@ -177,6 +179,7 @@ async def main():
         logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
     finally:
         await bot.stop()
+
 
 if __name__ == "__main__":
     # Windows-specific event loop policy
