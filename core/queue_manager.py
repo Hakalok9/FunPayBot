@@ -59,6 +59,7 @@ class MessageQueueManager:
         if self.running:
             logger.warning("⚠️ Менеджер очереди уже запущен")
             return
+        
         self.running = True
         self.worker_task = asyncio.create_task(self._worker(send_callback))
         logger.info("✓ Менеджер очереди запущен")
@@ -66,6 +67,7 @@ class MessageQueueManager:
     async def stop(self):
         if not self.running:
             return
+        
         self.running = False
         if self.worker_task:
             self.worker_task.cancel()
@@ -73,6 +75,7 @@ class MessageQueueManager:
                 await self.worker_task
             except asyncio.CancelledError:
                 pass
+        
         logger.info("✓ Менеджер очереди остановлен")
 
     async def _worker(self, send_callback):
@@ -83,12 +86,16 @@ class MessageQueueManager:
                     message = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
+                
                 await self._enforce_rate_limit()
+                
                 success = await self._send_with_retry(message, send_callback)
+                
                 if success:
                     self.stats["total_sent"] += 1
                 else:
                     self.stats["total_failed"] += 1
+                
                 if message.callback:
                     try:
                         if asyncio.iscoroutinefunction(message.callback):
@@ -97,6 +104,7 @@ class MessageQueueManager:
                             message.callback(success, message.metadata)
                     except Exception as e:
                         logger.error(f"Ошибка в callback: {e}")
+                
                 self.queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -108,10 +116,12 @@ class MessageQueueManager:
         if self.last_send_time is None:
             self.last_send_time = datetime.now()
             return
+        
         elapsed = (datetime.now() - self.last_send_time).total_seconds()
         if elapsed < self.send_delay:
             wait_time = self.send_delay - elapsed
             await asyncio.sleep(wait_time)
+        
         self.last_send_time = datetime.now()
 
     async def _send_with_retry(self, message, send_callback):
@@ -126,6 +136,7 @@ class MessageQueueManager:
                 logger.error(f"Ошибка отправки (попытка {attempt}/{self.max_retries}): {e}")
                 if attempt < self.max_retries:
                     await asyncio.sleep(attempt * 2)
+        
         return False
 
     def get_stats(self):

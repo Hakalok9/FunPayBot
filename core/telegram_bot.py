@@ -1,27 +1,21 @@
 """
-bots/telegram_bot.py - Telegram бот с поддержкой ответов в FunPay
+core/telegram_bot.py — ТОЛЬКО HELP И STATS (БЕЗ DEBUG)
 """
-
 import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 logger = logging.getLogger("FunPayBot.TelegramBot")
 
 class TelegramBot:
-    def __init__(self, token, admin_id, on_reply_callback=None, funpay_client=None):
+    def __init__(self, token, admin_id, on_reply_callback=None):
         self.token = token
         self.admin_id = int(admin_id)
         self.on_reply_callback = on_reply_callback
-        self.funpay_client = funpay_client  # Ссылка на FunPayClient для отправки сообщений
         self.app = None
-        self.active_chat = None  # Текущий активный чат для ответа
-        self.stats = {
-            "notifications_sent": 0,
-            "replies_sent": 0,
-            "commands_processed": 0
-        }
+        self.awaiting_reply = {}
+        self.stats = {"notifications_sent": 0, "replies_sent": 0, "commands_processed": 0}
         logger.info("✓ Telegram бот инициализирован")
 
     async def start(self):
@@ -29,37 +23,32 @@ class TelegramBot:
         try:
             logger.info("🔄 Запуск Telegram бота...")
             
-            # Создаём приложение
             self.app = Application.builder().token(self.token).build()
             
-            # Регистрируем обработчики
-            self.app.add_handler(CommandHandler("start", self._cmd_start))
             self.app.add_handler(CommandHandler("help", self._cmd_help))
             self.app.add_handler(CommandHandler("stats", self._cmd_stats))
-            self.app.add_handler(CommandHandler("chats", self._cmd_chats))
-            self.app.add_handler(CallbackQueryHandler(self._handle_callback))
+            self.app.add_handler(CallbackQueryHandler(self._button_callback))
             self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
             
-            # Инициализируем
             await self.app.initialize()
             await self.app.start()
             
-            # Запускаем polling
-            await self.app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await self.app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
             
             logger.info("✓ Telegram бот запущен (polling активен)")
             
-            # Отправляем уведомление о запуске
             try:
                 await self.app.bot.send_message(
                     chat_id=self.admin_id,
-                    text="🤖 FunPay Bot запущен!\n\nБот активен и слушает события FunPay.\n\n/chats - показать активные чаты",
+                    text="🤖 FunPay Bot запущен!\n\nБот активен и слушает события FunPay.",
                     parse_mode="HTML"
                 )
                 logger.info("✅ Уведомление о запуске отправлено")
             except Exception as e:
                 logger.error(f"⚠️ Не удалось отправить уведомление: {e}")
-                
         except Exception as e:
             logger.error(f"✗ Ошибка запуска Telegram бота: {e}", exc_info=True)
             raise
@@ -75,46 +64,20 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Ошибка при остановке: {e}")
 
-    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /start"""
-        try:
-            user_id = update.effective_user.id
-            logger.info(f"📥 /start от user_id={user_id}")
-            self.stats["commands_processed"] += 1
-            
-            await update.message.reply_text(
-                "🤖 FunPay Bot (Production)\n\n"
-                "Бот активен!\n\n"
-                "Команды:\n"
-                "/start - Запуск\n"
-                "/chats - Список активных чатов\n"
-                "/help - Справка\n"
-                "/stats - Статистика\n\n"
-                "💡 Когда придёт сообщение, нажми кнопку 'Ответить' и напиши ответ",
-                parse_mode="HTML"
-            )
-            logger.info(f"✅ Ответ на /start отправлен")
-        except Exception as e:
-            logger.error(f"❌ Ошибка в _cmd_start: {e}", exc_info=True)
-
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
         try:
-            user_id = update.effective_user.id
-            logger.info(f"📥 /help от user_id={user_id}")
             self.stats["commands_processed"] += 1
             
             await update.message.reply_text(
-                "📖 Справка\n\n"
-                "Команды для управления ботом:\n"
-                "/start - Запуск\n"
-                "/chats - Показать активные чаты\n"
+                "📖 <b>Справка</b>\n\n"
+                "Доступные команды:\n"
                 "/help - Эта справка\n"
-                "/stats - Статистика\n\n"
-                "Как отвечать:\n"
-                "1️⃣ Получишь уведомление о новом сообщении\n"
-                "2️⃣ Нажми кнопку 'Ответить' чтобы выбрать чат\n"
-                "3️⃣ Напиши ответ обычным сообщением\n"
+                "/stats - Статистика бота\n\n"
+                "<b>Как это работает:</b>\n"
+                "1️⃣ Когда приходит сообщение из FunPay, я отправляю тебе уведомление\n"
+                "2️⃣ Нажимаешь кнопку <b>\"✍️ Ответить\"</b>\n"
+                "3️⃣ Пишешь ответ в этот чат\n"
                 "4️⃣ Ответ автоматически отправится в FunPay",
                 parse_mode="HTML"
             )
@@ -124,90 +87,40 @@ class TelegramBot:
     async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /stats"""
         try:
-            user_id = update.effective_user.id
-            logger.info(f"📥 /stats от user_id={user_id}")
             self.stats["commands_processed"] += 1
             
-            active_str = f"chat_id={self.active_chat}" if self.active_chat else "нет активного"
-            
             await update.message.reply_text(
-                f"📊 Статистика\n\n"
-                f"Уведомлений отправлено: {self.stats['notifications_sent']}\n"
-                f"Ответов отправлено: {self.stats['replies_sent']}\n"
-                f"Команд обработано: {self.stats['commands_processed']}\n\n"
-                f"Активный чат: {active_str}",
+                f"📊 <b>Статистика</b>\n\n"
+                f"📬 Уведомлений отправлено: <b>{self.stats['notifications_sent']}</b>\n"
+                f"💬 Ответов отправлено: <b>{self.stats['replies_sent']}</b>\n"
+                f"⌨️ Команд обработано: <b>{self.stats['commands_processed']}</b>",
                 parse_mode="HTML"
             )
         except Exception as e:
             logger.error(f"❌ Ошибка в _cmd_stats: {e}", exc_info=True)
 
-    async def _cmd_chats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /chats - показать список чатов"""
+    async def _button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка нажатий кнопок"""
+        query = update.callback_query
+        await query.answer()
+        
         try:
-            user_id = update.effective_user.id
-            logger.info(f"📥 /chats от user_id={user_id}")
-            self.stats["commands_processed"] += 1
-            
-            if not self.funpay_client or not self.funpay_client.account:
-                await update.message.reply_text("❌ FunPay клиент не инициализирован")
-                return
-            
-            try:
-                # Получаем список чатов
-                account = self.funpay_client.account
-                chats = account.get_chats()
-                
-                if not chats:
-                    await update.message.reply_text("📭 Активных чатов не найдено")
-                    return
-                
-                # Создаём кнопки для каждого чата
-                keyboard = []
-                for chat in chats[:10]:  # Максимум 10 кнопок
-                    chat_id = chat.id if hasattr(chat, 'id') else str(chat)
-                    chat_name = chat.name if hasattr(chat, 'name') else f"Chat {chat_id}"
-                    
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"💬 {chat_name}",
-                            callback_data=f"select_chat:{chat_id}"
-                        )
-                    ])
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(
-                    "📋 Выбери чат для ответа:",
-                    reply_markup=reply_markup
-                )
-                logger.info(f"✅ Показано {len(chats)} чатов")
-                
-            except Exception as e:
-                logger.error(f"⚠️ Ошибка получения чатов: {e}")
-                await update.message.reply_text(f"❌ Ошибка получения чатов: {str(e)[:100]}")
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка в _cmd_chats: {e}", exc_info=True)
-
-    async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка нажатия на кнопки"""
-        try:
-            query = update.callback_query
-            await query.answer()  # Убираем "loading"
-            
-            if query.data.startswith("select_chat:"):
-                chat_id = int(query.data.split(":")[1])
-                self.active_chat = chat_id
-                
-                logger.info(f"✅ Выбран чат: {chat_id}")
+            if query.data.startswith("reply_"):
+                chat_id = int(query.data.split("_")[1])
+                self.awaiting_reply[query.from_user.id] = chat_id
                 
                 await query.edit_message_text(
-                    f"✅ Чат выбран! (ID: {chat_id})\n\n"
-                    f"Теперь напиши ответ обычным сообщением"
+                    text=query.message.text + "\n\n✍️ <b>Режим ответа активирован.</b> Напиши ответ:",
+                    parse_mode="HTML"
                 )
                 
+            elif query.data == "skip":
+                await query.edit_message_text(
+                    text=query.message.text + "\n\n⏭️ <b>Пропущено.</b>",
+                    parse_mode="HTML"
+                )
         except Exception as e:
-            logger.error(f"❌ Ошибка в _handle_callback: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка в _button_callback: {e}", exc_info=True)
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка текстовых сообщений"""
@@ -215,64 +128,58 @@ class TelegramBot:
             user_id = update.effective_user.id
             text = update.message.text
             
-            logger.info(f"📥 Сообщение от user_id={user_id}: {text[:50]}")
-            
-            # Если есть активный чат - отправляем ответ в FunPay
-            if self.active_chat:
-                logger.info(f"📤 Отправляю ответ в чат {self.active_chat}: {text[:50]}")
+            if user_id in self.awaiting_reply:
+                chat_id = self.awaiting_reply[user_id]
                 
-                if self.funpay_client:
+                if self.on_reply_callback:
                     try:
-                        # Отправляем сообщение в FunPay
-                        await self.funpay_client.send_message(self.active_chat, text)
-                        
-                        self.stats["replies_sent"] += 1
-                        await update.message.reply_text("✅ Ответ отправлен в FunPay!")
-                        logger.info(f"✅ Ответ отправлен в FunPay (chat_id={self.active_chat})")
-                        
-                        # Очищаем активный чат
-                        self.active_chat = None
-                        
+                        success = await self.on_reply_callback(chat_id, text)
+                        if success:
+                            self.stats["replies_sent"] += 1
+                            await update.message.reply_text("✅ Ответ отправлен в FunPay!")
+                        else:
+                            await update.message.reply_text("❌ Ошибка отправки ответа")
                     except Exception as e:
-                        logger.error(f"❌ Ошибка отправки: {e}")
-                        await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
-                else:
-                    await update.message.reply_text("❌ FunPay клиент не инициализирован")
+                        logger.error(f"❌ Ошибка: {e}", exc_info=True)
+                        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+                
+                del self.awaiting_reply[user_id]
             else:
                 await update.message.reply_text(
-                    "❓ Нет активного чата\n\n"
-                    "Варианты:\n"
-                    "1. Используй /chats для выбора чата\n"
-                    "2. Нажми кнопку 'Ответить' в уведомлении о сообщении"
+                    "ℹ️ Нет активных сообщений для ответа.\n\n"
+                    "Когда приходит сообщение из FunPay, нажми кнопку <b>'✍️ Ответить'</b>.",
+                    parse_mode="HTML"
                 )
-                
         except Exception as e:
             logger.error(f"❌ Ошибка в _handle_message: {e}", exc_info=True)
 
     async def send_message_notification(self, chat_id, username, text, timestamp=None):
-        """Отправка уведомления о новом сообщении с кнопкой ответа"""
+        """Отправка уведомления о новом сообщении с кнопками"""
         try:
             if not self.app:
                 logger.error("❌ Бот не инициализирован")
                 return
             
-            notification = f"💬 Новое сообщение от <b>{username}</b>\n\n{text[:200]}"
+            notification = (
+                f"💬 <b>Новое сообщение от {username}</b>\n\n"
+                f"<b>Сообщение:</b>\n{text[:500]}"
+            )
             
-            # Создаём кнопку для быстрого ответа
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 Ответить", callback_data=f"select_chat:{chat_id}")]
+                [
+                    InlineKeyboardButton("✍️ Ответить", callback_data=f"reply_{chat_id}"),
+                    InlineKeyboardButton("⏭️ Пропустить", callback_data="skip")
+                ]
             ])
             
             await self.app.bot.send_message(
-                chat_id=self.admin_id,
+                chat_id=self.admin_id, 
                 text=notification,
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
             
             self.stats["notifications_sent"] += 1
-            logger.info(f"✅ Уведомление о сообщении отправлено (с кнопкой ответа)")
-            
         except Exception as e:
             logger.error(f"❌ Ошибка отправки уведомления: {e}")
 
@@ -284,16 +191,13 @@ class TelegramBot:
                 return
             
             price_str = f"{price:.2f} ₽" if price else "не указана"
-            notification = f"🛒 Новый заказ!\n\nID: {order_id}\nПокупатель: {buyer_username}\nОписание: {description}\nЦена: {price_str}"
+            notification = f"🛒 <b>Новый заказ!</b>\n\n<b>ID:</b> {order_id}\n<b>Покупатель:</b> {buyer_username}\n<b>Описание:</b> {description}\n<b>Цена:</b> {price_str}"
             
-            await self.app.bot.send_message(chat_id=self.admin_id, text=notification)
-            
+            await self.app.bot.send_message(
+                chat_id=self.admin_id, 
+                text=notification,
+                parse_mode="HTML"
+            )
             self.stats["notifications_sent"] += 1
-            logger.info(f"✅ Уведомление о заказе отправлено")
-            
         except Exception as e:
             logger.error(f"❌ Ошибка отправки уведомления о заказе: {e}")
-
-    def get_stats(self):
-        """Получение статистики"""
-        return self.stats.copy()

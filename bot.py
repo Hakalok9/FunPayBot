@@ -1,16 +1,14 @@
-"""
-ПОЛНЫЙ ФАЙЛ: bot.py
-"""
-
 import sys
 import signal
 import asyncio
 import platform
+
 from config import Config
 
 # FAIL-FAST VALIDATION
 if not Config.FUNPAY_TOKEN:
     raise SystemExit("FATAL: FUNPAY_TOKEN not set in .env")
+
 if not Config.TELEGRAM_BOT_TOKEN:
     raise SystemExit("FATAL: TELEGRAM_BOT_TOKEN not set in .env")
 
@@ -45,42 +43,41 @@ class FunPayBot:
         self.event_handler = None
 
     async def initialize(self):
-        """Инициализация всех компонентов"""
         logger.info("=" * 80)
         logger.info("🚀 ЗАПУСК FUNPAY BOT (PRODUCTION)")
         logger.info("=" * 80)
         logger.info("🔧 Инициализация компонентов...")
 
-        # Database
+        # БД
         self.database = Database(Config.DATABASE_PATH)
         await self.database.connect()
 
-        # FunPay Client
+        # FunPay клиент
         self.funpay_client = FunPayClient(
             token=Config.FUNPAY_TOKEN,
             requests_delay=Config.MESSAGE_SEND_DELAY
         )
         await self.funpay_client.connect()
 
-        # Queue Manager
+        # Менеджер очереди
         self.queue_manager = MessageQueueManager(
             max_size=Config.MESSAGE_QUEUE_MAX_SIZE,
             send_delay=Config.MESSAGE_SEND_DELAY
         )
 
-        # Telegram Bot (с callback для ответов И ссылкой на funpay_client!)
-        async def reply_callback(chat_id: int, text: str):
+        # Колбэк для ответов из Telegram
+        async def reply_callback(chat_id: int, text: str) -> bool:
             await self.funpay_client.send_message(chat_id, text)
             return True
 
+        # Telegram бот
         self.telegram_bot = TelegramBot(
             token=Config.TELEGRAM_BOT_TOKEN,
             admin_id=Config.TELEGRAM_ADMIN_ID,
-            on_reply_callback=reply_callback,
-            funpay_client=self.funpay_client  # ← ДОБАВЛЕНО!
+            on_reply_callback=reply_callback
         )
 
-        # Message Handler (БЕЗ autoresponder)
+        # Обработчики
         self.message_handler = MessageHandler(
             database=self.database,
             telegram_bot=self.telegram_bot,
@@ -88,46 +85,47 @@ class FunPayBot:
             queue_manager=self.queue_manager
         )
 
-        # Order Handler
         self.order_handler = OrderHandler(
             database=self.database,
             telegram_bot=self.telegram_bot
         )
 
-        # Event Handler
         self.event_handler = EventHandler(
             message_handler=self.message_handler,
             order_handler=self.order_handler
         )
 
-        # Регистрируем обработчики событий FunPay
-        self.funpay_client.register_handler("NEW_MESSAGE", self.event_handler.handle_message)
-        self.funpay_client.register_handler("NEW_ORDER", self.event_handler.handle_order)
+        # Регистрация обработчиков событий FunPay
+        self.funpay_client.register_handler(
+            "NEW_MESSAGE", self.event_handler.handle_message
+        )
+        self.funpay_client.register_handler(
+            "NEW_ORDER", self.event_handler.handle_order
+        )
 
         logger.info("✅ Все компоненты инициализированы")
 
     async def start(self):
-        """Запуск бота"""
         self.running = True
 
-        # Запускаем Telegram бота
+        # Старт Telegram бота
         await self.telegram_bot.start()
 
-        # Запускаем Queue Manager
+        # Старт очереди отправки сообщений
         await self.queue_manager.start(self.funpay_client.send_message)
 
         logger.info("=" * 80)
         logger.info("✅ БОТ ПОЛНОСТЬЮ ЗАПУЩЕН И РАБОТАЕТ")
         logger.info("=" * 80)
 
-        # Запускаем FunPay слушатель (это будет работать параллельно)
+        # Прослушивание событий FunPay
         await self.funpay_client.start_listening()
 
     async def stop(self):
-        """Остановка бота"""
         logger.info("=" * 80)
         logger.info("🛑 ОСТАНОВКА БОТА (GRACEFUL SHUTDOWN)...")
         logger.info("=" * 80)
+
         self.running = False
 
         if self.funpay_client:
@@ -155,10 +153,8 @@ class FunPayBot:
 
 
 async def main():
-    """Главная функция с правильным управлением event loop"""
     bot = FunPayBot()
-    
-    # Signal handlers для graceful shutdown
+
     def signal_handler(sig, frame):
         logger.info(f"Получен сигнал {sig}, остановка бота...")
         asyncio.create_task(bot.stop())
@@ -167,12 +163,8 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # Инициализация
         await bot.initialize()
-
-        # Запуск (FunPay и Telegram работают параллельно)
         await bot.start()
-
     except KeyboardInterrupt:
         logger.info("Получен KeyboardInterrupt, остановка...")
     except Exception as e:
@@ -182,9 +174,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Windows-specific event loop policy
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    # Запуск
     asyncio.run(main())
