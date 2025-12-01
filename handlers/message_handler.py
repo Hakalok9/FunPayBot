@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import random
 from datetime import datetime
 
 logger = logging.getLogger("FunPayBot.MessageHandler")
@@ -20,14 +19,23 @@ class MessageHandler:
         """
         try:
             chat_id = message.chat_id
+            # Пытаемся получить ID автора, если он есть в объекте, иначе 0
+            author_id = getattr(message, 'author_id', 0)
             author = str(message.author)
             text = message.text
 
             # --- ЛОГИКА 2: Сохранение в БД ---
             if self.database:
                 try:
-                    # Убрал is_bot=False, так как такого аргумента нет
-                    await self.database.add_message(chat_id, author, text)
+                    # Передаем все аргументы, которые ждет Database.add_message
+                    # chat_id, author_id, author_username, text, is_outgoing
+                    await self.database.add_message(
+                        chat_id=chat_id,
+                        author_id=author_id,
+                        author_username=author,
+                        text=text,
+                        is_outgoing=False
+                    )
                 except Exception as e:
                     logger.error(f"Ошибка БД при сохранении сообщения: {e}")
 
@@ -53,8 +61,15 @@ class MessageHandler:
 
                         # Сохраняем ответ бота в БД
                         if self.database:
-                            # Убрал is_bot=True
-                            await self.database.add_message(chat_id, "Bot", response)
+                            # Сохраняем исходящее сообщение бота
+                            # Для бота ID обычно 0 или ID аккаунта (если известен, но тут ставим 0)
+                            await self.database.add_message(
+                                chat_id=chat_id,
+                                author_id=0,
+                                author_username="Bot",
+                                text=response,
+                                is_outgoing=True
+                            )
                     else:
                         logger.error("❌ QueueManager не инициализирован!")
 
